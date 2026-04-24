@@ -12,15 +12,15 @@ ACOLITE_TASK_QUEUE = os.getenv("ACOLITE_TASK_QUEUE", "acolite_run_queue")
 POSTPROCESS_QUEUE_NAME = os.getenv("POSTPROCESS_QUEUE_NAME", "mosaic_postprocess_queue")
 
 # --- 目录路径配置 ---
-TEMP_DIR = os.getenv("TEMP_DIR", r"G:\demo_test\virtual-date\Temp_L1_Data")
-ACOLITE_OUT_DIR = os.getenv("ACOLITE_OUT_DIR", r"G:\demo_test\virtual-date\L2_Acolite")
-FINAL_OUTPUT_DIR = os.getenv("FINAL_OUTPUT_DIR", r"G:\demo_test\virtual-date\Final_Products")
+TEMP_DIR = os.getenv("TEMP_DIR", r"")
+ACOLITE_OUT_DIR = os.getenv("ACOLITE_OUT_DIR", r"")
+FINAL_OUTPUT_DIR = os.getenv("FINAL_OUTPUT_DIR", r"")
 # 存放所有湖泊 SHP 文件的目录
-MASK_SHP_DIR = os.getenv("MASK_SHP_DIR", r"G:\demo_test\virtual-date\lake_shp")
+MASK_SHP_DIR = os.getenv("MASK_SHP_DIR", r"")
 
 # --- ACOLITE 环境配置 ---
-ACOLITE_CLI_PATH = os.getenv("ACOLITE_CLI_PATH", r"E:\acolite\launch_acolite.py")
-ACOLITE_PYTHON = os.getenv("ACOLITE_PYTHON", r"C:\Users\19743\miniconda3\envs\acolite\python.exe")
+ACOLITE_CLI_PATH = os.getenv("ACOLITE_CLI_PATH", r"launch_acolite.py")
+ACOLITE_PYTHON = os.getenv("ACOLITE_PYTHON", r"miniconda3\envs\acolite\python.exe")
 
 # --- 系统运行参数 ---
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "60"))
