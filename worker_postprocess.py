@@ -49,7 +49,7 @@ def process_gis_mosaic(task: Dict[str, Any]) -> int:
     target_date = str(task.get("target_date", ""))
     acolite_dir = str(task.get("acolite_dir", ""))
 
-    # 🌟 核心对接：获取由 Producer 一路传过来的精准 SHP 路径
+    # 获取由 Producer 一路传过来的精准 SHP 路径
     task_shp_path = task.get("shp_path", "")
 
     if not lake_uid or not target_date or not acolite_dir:
@@ -60,7 +60,7 @@ def process_gis_mosaic(task: Dict[str, Any]) -> int:
     lake_out_dir = os.path.join(FINAL_OUTPUT_DIR, lake_uid, target_date)
     os.makedirs(lake_out_dir, exist_ok=True)
 
-    # 🌟 优先使用任务中带过来的 SHP 路径，如果没有则退化为按 UID 去配置目录里猜
+    #优先使用任务中带过来的 SHP 路径，如果没有则退化为按 UID 去配置目录里猜
     shp_path = None
     if task_shp_path and os.path.exists(task_shp_path):
         shp_path = task_shp_path
