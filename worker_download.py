@@ -70,7 +70,7 @@ def extract_archive(archive_path: str, extract_path: str, archive_ext: str) -> N
 
 
 def resolve_input_product_dir(extract_path: str, sensor_key: str) -> str:
-    # 🌟 修复 1：加回对 Landsat 数据的支持识别
+    # 回对 Landsat 数据的支持识别
     sensor = sensor_key.upper()
     if sensor == "LANDSAT":
         mtl_candidates: List[str] = []
@@ -101,7 +101,6 @@ def process_only_download(task: Dict[str, Any], channel) -> str:
     safe_scene_name = sanitize_filename(scene_name)
     archive_path = os.path.join(TEMP_DIR, safe_scene_name + archive_suffix)
 
-    # 🌟 修复 2：彻底解决 Windows 长路径与文件夹命名冲突问题，采用唯一 scene_id
     unique_suffix = sanitize_filename(scene_id) if scene_id else safe_scene_name[-15:]
     extract_path = os.path.join(TEMP_DIR, f"ext_{unique_suffix}")
     success_marker = os.path.join(extract_path, ".extraction_success")
