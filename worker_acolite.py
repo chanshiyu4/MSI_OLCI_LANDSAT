@@ -73,9 +73,8 @@ def run_acolite(
         handle.write("aerosol_correction=dark_spectrum\n")
 
         handle.write("dsf_path_reflectance=tiled\n")
-        # 将云掩膜阈值从默认的 0.02 提升到 0.1，防止太湖藻类/泥沙高反被当成云抹除
+        # 云掩膜阈值
         handle.write("l1_mac_th=0.1\n")
-        # 只要有 0.1% 的有效水体像素，就强行计算气溶胶，不许报错退出
         handle.write("dsf_min_tile_fraction=0.001\n")
         # 输出 DSF 气溶胶计算过程参数，方便排查
         handle.write("dsf_write_tiled_parameters=True\n")
@@ -135,7 +134,6 @@ def run_acolite(
         check=False
     )
 
-    # 🌟 核心日志增强：把 ACOLITE 所有的标准输出和错误输出无删减写入文件
     with open(acolite_log_file, "w", encoding="utf-8") as f:
         f.write("=== ACOLITE SETTINGS ===\n")
         with open(settings_file, "r") as sf:
