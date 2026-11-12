@@ -1,13 +1,13 @@
-
 __pycache__/
 *.pyc
+/.pytest_cache/
 
-
-.env
-
+# Local credentials and environment backups
+.env*
+.secrets*
+secrets/
 
 *.part
 *.part.validator
-/.pytest_cache/
 /data/
 /logs/
