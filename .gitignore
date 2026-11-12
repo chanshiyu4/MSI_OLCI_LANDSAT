@@ -7,3 +7,7 @@ __pycache__/
 
 
 *.part
+*.part.validator
+/.pytest_cache/
+/data/
+/logs/

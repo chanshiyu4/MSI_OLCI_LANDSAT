@@ -1,19 +1,32 @@
 param(
     [string]$Sensors = "MSI,OLCI,LANDSAT",
-    [switch]$NoProducer
+    [switch]$NoProducer,
+    [ValidateRange(0, 2147483647)][int]$DownloadWorkers = 1,
+    [ValidateRange(0, 2147483647)][int]$AcoliteWorkers = 1,
+    [ValidateRange(0, 2147483647)][int]$PostprocessWorkers = 1
 )
 
 $ErrorActionPreference = "Stop"
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $scriptDir
-
+$python = (Get-Command python -CommandType Application).Source
 $env:ENABLED_SENSOR_KEYS = $Sensors
-Write-Host "ENABLED_SENSOR_KEYS=$($env:ENABLED_SENSOR_KEYS)"
 
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd `"$scriptDir`"; python worker_acolite.py"
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd `"$scriptDir`"; python worker_postprocess.py"
+$logDir = Join-Path $PSScriptRoot "logs"
+$null = New-Item -ItemType Directory -Path $logDir -Force
+$runId = "$(Get-Date -Format yyyyMMdd-HHmmss)-$PID"
 
+function Start-PipelineWorkers([string]$Stage, [int]$Count) {
+    for ($index = 1; $index -le $Count; $index++) {
+        $logPath = Join-Path $logDir "$runId-$Stage-$index.log"
+        $worker = Start-Process -FilePath $python -ArgumentList "-X", "utf8", "-u", "worker_$Stage.py" `
+            -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -RedirectStandardError $logPath -PassThru
+        Write-Host "$Stage worker PID $($worker.Id)  $logPath"
+    }
+}
+
+Start-PipelineWorkers "download" $DownloadWorkers
+Start-PipelineWorkers "acolite" $AcoliteWorkers
+Start-PipelineWorkers "postprocess" $PostprocessWorkers
 if (-not $NoProducer) {
-    Start-Sleep -Seconds 3
-    python monitor_producer.py
+    & $python (Join-Path $PSScriptRoot "monitor_producer.py")
+    exit $LASTEXITCODE
 }

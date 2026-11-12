@@ -3,9 +3,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $scriptDir
-
 $env:ENABLED_SENSOR_KEYS = $Sensors
-Write-Host "ENABLED_SENSOR_KEYS=$($env:ENABLED_SENSOR_KEYS)"
-python monitor_producer.py
+python (Join-Path $PSScriptRoot "monitor_producer.py")
+exit $LASTEXITCODE

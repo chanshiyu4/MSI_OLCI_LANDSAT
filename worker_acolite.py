@@ -1,262 +1,151 @@
-import glob
-import json
 import logging
 import os
-import re
-import shutil
 import subprocess
-import traceback
-from typing import Any, Dict, List
-
-import pika
+from pathlib import Path
 
 from config import (
     ACOLITE_CLI_PATH,
+    ACOLITE_EXPORT_L2R,
+    ACOLITE_KEEP_NETCDF,
     ACOLITE_OUT_DIR,
     ACOLITE_PYTHON,
+    ACOLITE_TASK_QUEUE,
+    FINAL_OUTPUT_DIR,
+    KEEP_RAW_CACHE,
     POSTPROCESS_QUEUE_NAME,
-    RABBITMQ_HOST,
+    TEMP_DIR,
 )
-
-ACOLITE_TASK_QUEUE = "acolite_run_queue"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - WORKER-ACOLITE - %(message)s")
-
-CLEAN_TEMP_ON_FAILURE = os.getenv("CLEAN_TEMP_ON_FAILURE", "0").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def sanitize_filename(name: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9._-]", "_", name)
-
-
-def normalize_target_date(task: Dict[str, Any]) -> str:
-    value = str(task.get("target_date", "")).replace("-", "")
-    if re.fullmatch(r"\d{8}", value):
-        return value
-    scene_name = str(task.get("scene_name", ""))
-    match = re.search(r"(\d{8})", scene_name)
-    return match.group(1) if match else "unknown"
+from pipeline_files import (
+    PARAMETER_PATTERN,
+    completed_files,
+    directory_lock,
+    final_revision,
+    mark_complete,
+    mask_path,
+    postprocess_task,
+    product_dir,
+    remove_work_dir,
+)
+from pipeline_queue import run_worker
+from worker_download import ensure_scene_input, raw_scene_paths
 
 
-def build_l2w_parameters(sensor_key: str) -> str:
-    return "Rrs_*"
+def _acolite_environment(python):
+    env = os.environ.copy()
+    for name in ("GDAL_DATA", "GDAL_DRIVER_PATH", "PROJ_LIB", "PROJ_DATA", "PROJ_DEBUG"):
+        env.pop(name, None)
+    env["PYTHONUTF8"] = "1"
+    if os.name == "nt":
+        prefix = python.parent
+        paths = [
+            prefix, prefix / "Library" / "mingw-w64" / "bin", prefix / "Library" / "usr" / "bin",
+            prefix / "Library" / "bin", prefix / "Scripts",
+        ]
+        env["PATH"] = os.pathsep.join([*(str(path) for path in paths), env.get("PATH", "")])
+        for name, directory in (
+            ("PROJ_LIB", "share/proj"), ("GDAL_DATA", "share/gdal"), ("GDAL_DRIVER_PATH", "lib/gdalplugins"),
+        ):
+            path = prefix / "Library" / directory
+            if path.is_dir():
+                env[name] = str(path)
+    return env
 
 
-def run_acolite(
-        input_product_dir: str,
-        limit: List[float],
-        lake_uid: str,
-        target_date: str,
-        scene_tag: str,
-        sensor_key: str,
-) -> str:
-    lake_out_dir = os.path.join(ACOLITE_OUT_DIR, lake_uid, target_date)
-    os.makedirs(lake_out_dir, exist_ok=True)
+def run_acolite(input_dir, limit, job, output_dir):
+    python = Path(ACOLITE_PYTHON).resolve()
+    cli = Path(ACOLITE_CLI_PATH).resolve()
+    for path in (python, cli):
+        if not path.is_file():
+            raise FileNotFoundError(f"ACOLITE executable or launcher not found: {path}")
 
-    settings_file = os.path.join(lake_out_dir, f"settings_{sanitize_filename(scene_tag)}.txt")
+    remove_work_dir(ACOLITE_OUT_DIR, output_dir)
+    output_dir.mkdir(parents=True)
+    settings = {
+        "inputfile": str(input_dir),
+        "output": str(output_dir),
+        "limit": ",".join(map(str, limit)),
+        "aerosol_correction": "dark_spectrum",
+        "dsf_path_reflectance": "tiled",
+        "l1_mac_th": 0.1,
+        "dsf_min_tile_fraction": 0.001,
+        "dsf_write_tiled_parameters": ACOLITE_KEEP_NETCDF,
+        "l2w_parameters": "Rrs_*",
+        "l2w_mask": False,
+        "output_projection": True,
+        "l1r_delete_netcdf": not ACOLITE_KEEP_NETCDF,
+        "l2r_delete_netcdf": not ACOLITE_KEEP_NETCDF,
+        "l2w_delete_netcdf": not ACOLITE_KEEP_NETCDF,
+        "l2r_export_geotiff": ACOLITE_EXPORT_L2R,
+        "l2w_export_geotiff": True,
+    }
+    if job["sensor_key"] == "OLCI":
+        settings.update({
+            "reproject_outputs": "L2R,L2W",
+            "output_projection_epsg": 4326,
+            "output_projection_resolution": "0.0027,0.0027",
+            "out_proj": "EPSG:4326",
+            "reproject_resolution": 0.0027,
+        })
+    else:
+        settings["map_projected"] = True
 
-    # 记录完整日志的文件路径
-    acolite_log_file = os.path.join(lake_out_dir, f"acolite_full_run_{sanitize_filename(scene_tag)}.log")
+    settings_file = output_dir / "settings.txt"
+    settings_file.write_text("".join(f"{key}={value}\n" for key, value in settings.items()), encoding="utf-8")
+    log_file = output_dir / "acolite.log"
+    logging.info("ACOLITE lake=%s scene=%s", job["lake_uid"], job["scene_name"])
+    with log_file.open("wb") as log:
+        result = subprocess.run(
+            [str(python), str(cli), "--cli", f"--settings={settings_file}"],
+            env=_acolite_environment(python), stdout=log, stderr=subprocess.STDOUT, check=False,
+        )
+    if result.returncode:
+        raise RuntimeError(f"ACOLITE exited with code {result.returncode}: {log_file}")
 
-    # 坐标顺序已修复为 ACOLITE 规范: South, West, North, East
-    limit_str = f"{limit[0]},{limit[1]},{limit[2]},{limit[3]}"
-    l2w_parameters = build_l2w_parameters(sensor_key)
-
-    is_sentinel_3 = "OLCI" in scene_tag or "S3" in scene_tag or sensor_key.upper() == "OLCI"
-
-    with open(settings_file, "w", encoding="utf-8") as handle:
-        handle.write(f"inputfile={input_product_dir}\n")
-        handle.write(f"output={lake_out_dir}\n")
-        handle.write(f"limit={limit_str}\n")
-
-        # 大气校正基础设置
-        handle.write("aerosol_correction=dark_spectrum\n")
-
-        handle.write("dsf_path_reflectance=tiled\n")
-        # 云掩膜阈值
-        handle.write("l1_mac_th=0.1\n")
-        handle.write("dsf_min_tile_fraction=0.001\n")
-        # 输出 DSF 气溶胶计算过程参数，方便排查
-        handle.write("dsf_write_tiled_parameters=True\n")
-
-        handle.write(f"l2w_parameters={l2w_parameters}\n")
-        handle.write("l2w_mask=False\n")
-
-        if is_sentinel_3:
-            handle.write("output_projection=True\n")
-            handle.write("reproject_outputs=L2R,L2W\n")
-            handle.write("output_projection_epsg=4326\n")
-            handle.write("output_projection_resolution=0.0027,0.0027\n")
-            handle.write("out_proj=EPSG:4326\n")
-            handle.write("reproject_resolution=0.0027\n")
-        else:
-            handle.write("output_projection=True\n")
-            handle.write("map_projected=True\n")
-
-        # 强制保留所有中间文件用于排查
-        handle.write("l1r_nc_delete=False\n")
-        handle.write("l2r_nc_delete=False\n")
-        handle.write("l2w_nc_delete=False\n")
-        handle.write("l2r_export_geotiff=True\n")
-        handle.write("l2w_export_geotiff=True\n")
-
-    # 环境变量彻底重建
-    acolite_env_dir = os.path.dirname(ACOLITE_PYTHON)
-    custom_env = os.environ.copy()
-
-    for key in ['GDAL_DATA', 'GDAL_DRIVER_PATH', 'PROJ_LIB', 'PROJ_DATA', 'PROJ_DEBUG']:
-        if key in custom_env:
-            del custom_env[key]
-
-    acolite_paths = [
-        acolite_env_dir,
-        os.path.join(acolite_env_dir, "Library", "mingw-w64", "bin"),
-        os.path.join(acolite_env_dir, "Library", "usr", "bin"),
-        os.path.join(acolite_env_dir, "Library", "bin"),
-        os.path.join(acolite_env_dir, "Scripts"),
-    ]
-    custom_env["PATH"] = os.pathsep.join(acolite_paths) + os.pathsep + custom_env.get("PATH", "")
-
-    custom_env["PROJ_LIB"] = os.path.join(acolite_env_dir, "Library", "share", "proj")
-    custom_env["GDAL_DATA"] = os.path.join(acolite_env_dir, "Library", "share", "gdal")
-    custom_env["GDAL_DRIVER_PATH"] = os.path.join(acolite_env_dir, "Library", "lib", "gdalplugins")
-
-    before_tifs = set(glob.glob(os.path.join(lake_out_dir, "**", "*.tif"), recursive=True))
-
-    logging.info("Calling ACOLITE subprocess for scene: %s", scene_tag)
-
-    # 运行 ACOLITE
-    result = subprocess.run(
-        [ACOLITE_PYTHON, ACOLITE_CLI_PATH, "--cli", f"--settings={settings_file}"],
-        env=custom_env,
-        capture_output=True,
-        text=True,
-        check=False
-    )
-
-    with open(acolite_log_file, "w", encoding="utf-8") as f:
-        f.write("=== ACOLITE SETTINGS ===\n")
-        with open(settings_file, "r") as sf:
-            f.write(sf.read())
-        f.write("\n=== STDOUT ===\n")
-        f.write(result.stdout or "No stdout")
-        f.write("\n=== STDERR ===\n")
-        f.write(result.stderr or "No stderr")
-        f.write("\n=== RETURN CODE ===\n")
-        f.write(str(result.returncode))
-
-    if result.returncode != 0:
-        err_msg = (result.stderr or "")[-500:]
-        raise RuntimeError(
-            f"ACOLITE crashed! Return code {result.returncode}. Check full log at: {acolite_log_file}\nTail error: {err_msg}")
-
-    after_tifs = set(glob.glob(os.path.join(lake_out_dir, "**", "*.tif"), recursive=True))
-    created_tifs = after_tifs - before_tifs
-
-    if not created_tifs:
-        stdout_tail = (result.stdout or "")[-500:]
-        raise RuntimeError(
-            f"ACOLITE finished but NO TIF was produced. Check full log at: {acolite_log_file}\nTail info: {stdout_tail}")
-
-    return lake_out_dir
+    files = sorted(path for path in output_dir.rglob("*.tif") if PARAMETER_PATTERN.search(path.stem))
+    if not any("_rrs_" in path.stem.lower() for path in files):
+        raise RuntimeError(f"ACOLITE produced no Rrs GeoTIFFs: {log_file}")
+    mark_complete(output_dir, job["revision"], files)
 
 
-def cleanup_temp_files(extract_path: str, archive_path: str) -> None:
-    if extract_path and os.path.exists(extract_path):
-        shutil.rmtree(extract_path, ignore_errors=True)
-    if archive_path and os.path.exists(archive_path):
-        try:
-            os.remove(archive_path)
-        except:
-            pass
+def process_acolite(task):
+    lakes = task["lakes"]
+    if not lakes:
+        raise ValueError("ACOLITE task has no lakes")
+    archive_path, extract_path = raw_scene_paths(task)
+    input_dir = Path(task["input_product_dir"]) if task.get("input_product_dir") else None
+    failures = []
+    with directory_lock(archive_path):
+        for lake in lakes:
+            try:
+                job = postprocess_task(task, lake)
+                output_dir = product_dir(ACOLITE_OUT_DIR, job)
+                with directory_lock(output_dir):
+                    final_dir = product_dir(FINAL_OUTPUT_DIR, job)
+                    if completed_files(final_dir, final_revision(job, mask_path(job))):
+                        continue
+                    if not completed_files(output_dir, job["revision"]):
+                        if input_dir is None or not input_dir.is_dir():
+                            input_dir = ensure_scene_input(task, archive_path, extract_path)
+                        run_acolite(input_dir, lake["limit"], job, output_dir)
+                    job["acolite_dir"] = str(output_dir)
+                yield job
+            except Exception as exc:
+                failures.append(str(lake.get("uid", "")))
+                logging.error("ACOLITE lake=%s scene=%s: %s", lake.get("uid"), task.get("scene_name"), exc)
 
-
-def callback(ch, method, properties, body):
-    MAX_RETRIES = 3
-    headers = properties.headers or {}
-    retry_count = headers.get('retry_count', 0)
-
-    try:
-        task = json.loads(body)
-        input_dir = task.get("input_product_dir")
-        lakes = task.get("lakes") or []
-        scene_name = task.get("scene_name")
-        sensor_key = task.get("sensor_key")
-        target_date = normalize_target_date(task)
-
-        if not input_dir or not os.path.exists(input_dir):
-            raise FileNotFoundError(f"Input product directory not found: {input_dir}")
-
-        process_success = True
-        try:
-            for lake in lakes:
-                logging.info("Processing ACOLITE: Lake=%s, Scene=%s", lake['uid'], scene_name)
-                out_dir = run_acolite(
-                    input_product_dir=input_dir,
-                    limit=lake['limit'],
-                    lake_uid=lake['uid'],
-                    target_date=target_date,
-                    scene_tag=scene_name,
-                    sensor_key=sensor_key
-                )
-
-                next_task = {
-                    "scene_name": scene_name,
-                    "lake_uid": lake['uid'],
-                    "lake_name": lake.get('uname', lake['uid']),
-                    "target_date": target_date,
-                    "acolite_dir": out_dir,
-                    "sensor_key": sensor_key,
-                    "shp_path": task.get("shp_path", "")
-                }
-                ch.basic_publish(
-                    exchange="",
-                    routing_key=POSTPROCESS_QUEUE_NAME,
-                    body=json.dumps(next_task, ensure_ascii=False),
-                    properties=pika.BasicProperties(delivery_mode=2)
-                )
-        except Exception as e:
-            process_success = False
-            raise e
-        finally:
-            if process_success or CLEAN_TEMP_ON_FAILURE:
-                cleanup_temp_files(task.get("temp_extract_path"), task.get("temp_archive_path"))
-
-        ch.basic_ack(delivery_tag=method.delivery_tag)
-
-    except Exception as exc:
-        logging.error("Acolite Worker failed (Attempt %d/%d): %s", retry_count + 1, MAX_RETRIES, exc)
-        if retry_count < MAX_RETRIES:
-            headers['retry_count'] = retry_count + 1
-            ch.basic_publish(
-                exchange='',
-                routing_key=method.routing_key,
-                body=body,
-                properties=pika.BasicProperties(delivery_mode=2, headers=headers)
-            )
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-        else:
-            logging.critical("Acolite Worker permanently failed for scene: %s", body)
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        if failures:
+            raise RuntimeError(f"ACOLITE failed for scene {task.get('scene_name')}, lakes {', '.join(failures)}")
+        if not KEEP_RAW_CACHE:
+            try:
+                remove_work_dir(TEMP_DIR, extract_path)
+                archive_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logging.warning("Could not clean raw scene %s: %s", task.get("scene_name"), exc)
 
 
 def main():
-    connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST, heartbeat=3600))
-    channel = connection.channel()
-
-    channel.queue_declare(queue=ACOLITE_TASK_QUEUE, durable=True)
-    channel.queue_declare(queue=POSTPROCESS_QUEUE_NAME, durable=True)
-
-    channel.basic_qos(prefetch_count=1)
-    channel.basic_consume(queue=ACOLITE_TASK_QUEUE, on_message_callback=callback)
-
-    logging.info("ACOLITE worker started. Listening on queue: %s", ACOLITE_TASK_QUEUE)
-    try:
-        channel.start_consuming()
-    except KeyboardInterrupt:
-        channel.stop_consuming()
-    finally:
-        connection.close()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - ACOLITE - %(message)s")
+    run_worker(ACOLITE_TASK_QUEUE, process_acolite, POSTPROCESS_QUEUE_NAME)
 
 
 if __name__ == "__main__":

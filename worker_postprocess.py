@@ -1,155 +1,136 @@
-import glob
-import json
 import logging
-import os
-import re
-import shutil
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from tempfile import TemporaryDirectory
 
-import pika
 from osgeo import gdal
 
-from config import CLEAN_ACOLITE_TEMP, FINAL_OUTPUT_DIR, MASK_SHP_DIR, POSTPROCESS_QUEUE_NAME, RABBITMQ_HOST
+from config import ACOLITE_OUT_DIR, CLEAN_ACOLITE_TEMP, FINAL_OUTPUT_DIR, GDAL_THREADS, POSTPROCESS_QUEUE_NAME
+from pipeline_files import (
+    PARAMETER_PATTERN,
+    completed_files,
+    directory_lock,
+    final_revision,
+    mark_complete,
+    mask_path,
+    product_dir,
+    remove_work_dir,
+    sanitize_filename,
+    target_date,
+)
+from pipeline_queue import run_worker
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - POSTPROCESS - %(message)s")
 
-PARAMETER_PATTERN = re.compile(r"(Rrs_\d+|rhos_\d+|rhot_\d+|rhorc_\d+|fai)$", re.IGNORECASE)
+def _legacy_sources(task, directory):
+    # Older messages pointed to a shared lake/date folder. Use the scene's export log when available.
+    log = directory / f"acolite_full_run_{sanitize_filename(str(task.get('scene_name') or ''))}.log"
+    if log.is_file():
+        with log.open(encoding="utf-8", errors="replace") as handle:
+            paths = {
+                Path(line.strip()[6:]).resolve()
+                for line in handle
+                if line.startswith("Wrote ") and line.strip().lower().endswith(".tif")
+            }
+        if paths and all(path.is_relative_to(directory) for path in paths):
+            return sorted(paths)
+
+    files = sorted(path for path in directory.rglob("*.tif") if PARAMETER_PATTERN.search(path.stem))
+    products = {path.stem.rsplit("_L2", 1)[0] for path in files}
+    if len(products) > 1:
+        raise ValueError(f"Scene export log required for legacy directory with multiple products: {directory}")
+    return files
 
 
-def collect_parameter_groups(acolite_dir: str) -> Dict[str, List[str]]:
-    groups: Dict[str, List[str]] = {}
-    for tif_path in glob.glob(os.path.join(acolite_dir, "**", "*.tif"), recursive=True):
-        stem = Path(tif_path).stem
-        match = PARAMETER_PATTERN.search(stem)
-        if not match:
-            continue
-        parameter = match.group(1)
-        groups.setdefault(parameter, []).append(tif_path)
+def collect_parameter_groups(files):
+    groups = defaultdict(list)
+    for path in files:
+        match = PARAMETER_PATTERN.search(path.stem)
+        if match:
+            parameter = match.group(1).lower()
+            if parameter.startswith("rrs_"):
+                parameter = "Rrs_" + parameter[4:]
+            groups[parameter].append(str(path))
     return groups
 
 
-def build_warp_options(shp_path: Optional[str]) -> gdal.WarpOptions:
-    has_mask = bool(shp_path)
+def build_warp_options(shp_path):
     return gdal.WarpOptions(
-        creationOptions=["COMPRESS=LZW", "TILED=YES"],
+        format="GTiff",
         dstSRS="EPSG:4326",
-        # 核心抠图参数
-        cutlineDSName=shp_path if has_mask else None,
-        cropToCutline=has_mask,
-        # 增加 Alpha 通道，让湖泊之外的陆地背景强制变为透明，而不污染数据真实的 0 值
-        dstAlpha=has_mask,
-        srcNodata=0,
-        dstNodata=0,
+        creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER", f"NUM_THREADS={GDAL_THREADS}"],
+        multithread=GDAL_THREADS > 1,
+        warpOptions=[f"NUM_THREADS={GDAL_THREADS}"],
+        cutlineDSName=str(shp_path) if shp_path else None,
+        cropToCutline=bool(shp_path),
+        dstAlpha=bool(shp_path),
     )
 
 
-def process_gis_mosaic(task: Dict[str, Any]) -> int:
-    lake_uid = str(task.get("lake_uid", ""))
-    target_date = str(task.get("target_date", ""))
-    acolite_dir = str(task.get("acolite_dir", ""))
-
-    # 获取由 Producer 一路传过来的精准 SHP 路径
-    task_shp_path = task.get("shp_path", "")
-
-    if not lake_uid or not target_date or not acolite_dir:
-        raise ValueError(f"Invalid postprocess task: {task}")
-    if not os.path.isdir(acolite_dir):
-        raise FileNotFoundError(f"ACOLITE output directory does not exist: {acolite_dir}")
-
-    lake_out_dir = os.path.join(FINAL_OUTPUT_DIR, lake_uid, target_date)
-    os.makedirs(lake_out_dir, exist_ok=True)
-
-    #优先使用任务中带过来的 SHP 路径，如果没有则退化为按 UID 去配置目录里猜
-    shp_path = None
-    if task_shp_path and os.path.exists(task_shp_path):
-        shp_path = task_shp_path
+def _warp_parameter(inputs, destination, options):
+    if len(inputs) == 1:
+        source = inputs[0]
     else:
-        shp_candidate = os.path.join(MASK_SHP_DIR, f"{lake_uid}.shp")
-        if os.path.exists(shp_candidate):
-            shp_path = shp_candidate
-
-    if shp_path is None:
-        logging.warning("No shapefile mask found for lake=%s. Using full rectangular extent output.", lake_uid)
-    else:
-        logging.info("Found shapefile mask for lake=%s: %s", lake_uid, shp_path)
-
-    parameter_groups = collect_parameter_groups(acolite_dir)
-    if not parameter_groups:
-        raise RuntimeError(f"No geotiff parameters found in {acolite_dir}")
-
-    # 将找到的 SHP 路径传给裁剪配置器
-    options_clip = build_warp_options(shp_path)
-
-    success_count = 0
-    for parameter in sorted(parameter_groups.keys()):
-        input_tifs = sorted(parameter_groups[parameter])
-        vrt_path = os.path.join(acolite_dir, f"temp_{lake_uid}_{parameter}.vrt")
-        final_tif = os.path.join(lake_out_dir, f"{lake_uid}_{target_date}_{parameter}.tif")
-
-        logging.info("Mosaicking & Clipping lake=%s parameter=%s input_count=%s", lake_uid, parameter, len(input_tifs))
-        vrt_ds = gdal.BuildVRT(vrt_path, input_tifs)
-        if vrt_ds is None:
-            raise RuntimeError(f"BuildVRT failed for parameter {parameter}")
-        vrt_ds = None
-
-        # 执行终极掩膜裁剪
-        warp_ds = gdal.Warp(final_tif, vrt_path, options=options_clip)
-        if warp_ds is None:
-            raise RuntimeError(f"Warp failed for parameter {parameter}")
-        warp_ds = None
-
-        if os.path.exists(vrt_path):
-            os.remove(vrt_path)
-        success_count += 1
-
-    if success_count == 0:
-        raise RuntimeError(f"No output was generated for lake={lake_uid} date={target_date}")
-
-    if CLEAN_ACOLITE_TEMP:
-        shutil.rmtree(acolite_dir, ignore_errors=True)
-
-    logging.info("Postprocess complete lake=%s date=%s parameter_count=%s", lake_uid, target_date, success_count)
-    return success_count
+        source = gdal.BuildVRT("", inputs, strict=True)
+        if source is None:
+            raise RuntimeError(f"Could not build mosaic for {destination.name}")
+    result = gdal.Warp(str(destination), source, options=options)
+    if result is None:
+        raise RuntimeError(f"Could not write {destination.name}")
+    result.FlushCache()
+    result = None
 
 
-def callback(ch, method, properties, body):
-    try:
-        task = json.loads(body)
-        processed = process_gis_mosaic(task)
-        logging.info("Postprocess task acknowledged. Generated %s parameters.", processed)
-        ch.basic_ack(delivery_tag=method.delivery_tag)
-    except RuntimeError as exc:
-        message = str(exc)
-        if "No geotiff parameters found" in message:
-            logging.error("Postprocess drop task (no tif found, not requeue): %s", message)
-            ch.basic_ack(delivery_tag=method.delivery_tag)
+def process_gis_mosaic(task):
+    source_dir = Path(task["acolite_dir"]).resolve()
+    output_dir = product_dir(FINAL_OUTPUT_DIR, task)
+    scene_dir = product_dir(ACOLITE_OUT_DIR, task)
+    shp_path = mask_path(task)
+    revision = final_revision(task, shp_path)
+    with directory_lock(scene_dir):
+        done = completed_files(output_dir, revision)
+        if done:
+            return len(done)
+        previous = completed_files(output_dir)
+
+        if not source_dir.is_dir():
+            raise FileNotFoundError(f"ACOLITE output directory not found: {source_dir}")
+        if task.get("revision"):
+            files = completed_files(source_dir, task["revision"])
         else:
-            logging.error("Postprocess runtime error: %s", exc)
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-    except FileNotFoundError as exc:
-        # Upstream ACOLITE output disappeared or was not produced. Requeueing causes endless loops.
-        logging.error("Postprocess drop task (missing input dir): %s", exc)
-        ch.basic_ack(delivery_tag=method.delivery_tag)
-    except Exception as exc:
-        logging.error("Postprocess failed: %s", exc)
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            files = _legacy_sources(task, source_dir)
+        groups = collect_parameter_groups(files)
+        if not groups:
+            raise ValueError(f"No GeoTIFF bands found for {task.get('scene_name')} in {source_dir}")
+        if shp_path is None:
+            logging.warning("No mask for lake %s, using the image extent", task["lake_uid"])
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        options = build_warp_options(shp_path)
+        prefix = f"{task['lake_uid']}_{target_date(task)}_"
+        with TemporaryDirectory(prefix=".warp-", dir=output_dir) as temp_dir:
+            outputs = []
+            for parameter, inputs in sorted(groups.items()):
+                destination = Path(temp_dir) / f"{prefix}{parameter}.tif"
+                _warp_parameter(inputs, destination, options)
+                outputs.append(destination)
+            final_files = [path.replace(output_dir / path.name) for path in outputs]
+            for obsolete in set(previous).difference(final_files):
+                obsolete.unlink(missing_ok=True)
+            mark_complete(output_dir, revision, final_files)
+
+        if CLEAN_ACOLITE_TEMP and source_dir == scene_dir:
+            try:
+                remove_work_dir(ACOLITE_OUT_DIR, scene_dir)
+            except OSError as exc:
+                logging.warning("Could not clean ACOLITE files in %s: %s", scene_dir, exc)
+        logging.info("Postprocessed %d bands in %s", len(final_files), output_dir)
+        return len(final_files)
 
 
 def main():
-    connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
-    channel = connection.channel()
-    channel.queue_declare(queue=POSTPROCESS_QUEUE_NAME, durable=True)
-    channel.basic_qos(prefetch_count=1)
-    channel.basic_consume(queue=POSTPROCESS_QUEUE_NAME, on_message_callback=callback)
-
-    logging.info("Postprocess worker started. Waiting for queue=%s", POSTPROCESS_QUEUE_NAME)
-    try:
-        channel.start_consuming()
-    except KeyboardInterrupt:
-        channel.stop_consuming()
-    finally:
-        connection.close()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - POSTPROCESS - %(message)s")
+    gdal.UseExceptions()
+    run_worker(POSTPROCESS_QUEUE_NAME, process_gis_mosaic)
 
 
 if __name__ == "__main__":
